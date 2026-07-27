@@ -3,13 +3,23 @@ New IP Address -- NetBox custom script.
 
 Issues the next free IP address at a site to a network endpoint. The helpdesk
 picks a site and a prefix role; the script resolves the single site prefix
-carrying that role, takes the first free address in it, and records the address
-with the mask of the supernet the endpoint is actually configured with -- so an
-address drawn from a /24 site prefix inside a /16 supernet is stored as a /16.
+carrying that role and takes the first free address in it.
 
-That works because NetBox matches child IPs to a prefix by host containment
-(`address__host_between`), not by mask length: the /16-masked address still
-counts against the /24's available-IP list and utilization.
+The address is then recorded with the mask of the network the endpoint is
+actually configured on, not the mask of the site prefix it was drawn from. A
+/24 carved out of a /16 for site bookkeeping is not a broadcast domain of its
+own, so an address drawn from it is stored as a /16.
+
+Both the mask and the gateway come from the HSRP address serving the site
+prefix -- an IP address in NetBox with role HSRP, found in the site prefix's own
+prefix hierarchy (normally on the /16 supernet). That address is a real host on
+the network, so the mask it is recorded with is by definition the mask its
+endpoints use. Nothing about the addressing is hardcoded here.
+
+Widening the mask does not disturb the site prefix's bookkeeping: NetBox matches
+child IPs to a prefix by host containment (`address__host_between`), not by mask
+length, so the /16-masked address still counts against the /24's available-IP
+list and utilization.
 
 Written for NetBox 4.6.
 """
@@ -23,30 +33,18 @@ from django.db import transaction
 from dcim.models import Site
 from extras.models import CustomField
 from extras.scripts import ChoiceVar, ObjectVar, Script, StringVar
-from ipam.choices import IPAddressStatusChoices, PrefixStatusChoices
+from ipam.choices import (
+    IPAddressRoleChoices,
+    IPAddressStatusChoices,
+    PrefixStatusChoices,
+)
 from ipam.models import IPAddress, Prefix, Role
 from utilities.exceptions import AbortScript
 
 
 # ---------------------------------------------------------------------------
-# Configuration -- maintained by the network team, not by the helpdesk.
+# Configuration
 # ---------------------------------------------------------------------------
-
-# Every supernet an endpoint address may belong to, with the gateway endpoints
-# in it are configured with. The mask written onto the new address comes from
-# the supernet's prefix length, and the gateway and subnet mask custom fields
-# are filled from the matching entry.
-#
-# List site-local supernets (your /20s) here alongside the multi-site /16s. If
-# entries overlap, the most specific match wins. A resolved site prefix that no
-# entry covers aborts the script rather than guessing a mask.
-#
-# TODO: replace these examples with your real supernets.
-SUPERNETS = [
-    {'supernet': '10.1.0.0/16', 'gateway': '10.1.0.1'},
-    {'supernet': '10.2.0.0/16', 'gateway': '10.2.0.1'},
-    {'supernet': '172.20.16.0/20', 'gateway': '172.20.16.1'},
-]
 
 # Names (not labels) of the custom fields on ipam.IPAddress. The script checks
 # these exist before touching anything and tells you the real names if not.
@@ -74,41 +72,55 @@ def normalizeMacAddress(value):
     return ':'.join(cleaned[index:index + 2] for index in range(0, 12, 2))
 
 
-def resolveSupernet(prefix):
+def resolveGateway(prefix):
     """
-    Return the (network, gateway) pair from SUPERNETS that covers the prefix.
+    Return the HSRP address serving the given site prefix.
 
-    The most specific match wins, so a site-local /20 listed alongside the /16
-    it sits in behaves predictably.
+    Candidates are IP addresses with role HSRP anywhere in the prefix's own
+    hierarchy, itself included. A candidate only counts if the network it is
+    configured on actually covers the site prefix -- that rejects a gateway
+    sitting in a wider ancestor but belonging to a different broadcast domain,
+    and it rejects a gateway mistakenly recorded as a /32.
     """
     prefixNetwork = netaddr.IPNetwork(str(prefix.prefix))
-    matches = []
 
-    for entry in SUPERNETS:
-        try:
-            supernetNetwork = netaddr.IPNetwork(entry['supernet'])
-            gateway = netaddr.IPAddress(entry['gateway'])
-        except (KeyError, ValueError, netaddr.AddrFormatError) as error:
-            raise AbortScript(f"Malformed SUPERNETS entry {entry!r}: {error}")
+    candidates = {}
+    for ancestor in prefix.get_parents(include_self=True):
+        hsrpAddresses = ancestor.get_child_ips().filter(
+            role=IPAddressRoleChoices.ROLE_HSRP
+        )
+        for address in hsrpAddresses:
+            candidates[address.pk] = address
 
-        if gateway not in supernetNetwork:
-            raise AbortScript(
-                f"SUPERNETS is misconfigured: gateway {gateway} is not inside "
-                f"{supernetNetwork}."
+    serving = [
+        address for address in candidates.values()
+        if prefixNetwork in netaddr.IPNetwork(str(address.address)).cidr
+    ]
+
+    if not serving:
+        if candidates:
+            detail = (
+                f"HSRP addresses exist in the hierarchy but none covers this "
+                f"prefix: {', '.join(str(a.address) for a in candidates.values())}."
             )
-
-        if prefixNetwork in supernetNetwork:
-            matches.append((supernetNetwork, gateway))
-
-    if not matches:
+        else:
+            detail = "No HSRP addresses exist anywhere in this prefix's hierarchy."
         raise AbortScript(
-            f"{prefix.prefix} is not covered by any entry in SUPERNETS, so the "
-            f"endpoint mask and gateway are unknown. Add the supernet to the "
-            f"script configuration."
+            f"No HSRP address serves {prefix.prefix}, so the endpoint mask and "
+            f"gateway are unknown. Record the gateway in NetBox as an IP address "
+            f"with role HSRP, carrying the mask its endpoints are configured "
+            f"with (e.g. 10.111.0.1/16), in the same VRF. {detail}"
         )
 
-    matches.sort(key=lambda match: match[0].prefixlen, reverse=True)
-    return matches[0]
+    if len(serving) > 1:
+        found = ', '.join(str(address.address) for address in serving)
+        raise AbortScript(
+            f"Found {len(serving)} HSRP addresses serving {prefix.prefix}: "
+            f"{found}. Exactly one is needed to determine the endpoint mask and "
+            f"gateway. Resolve this in NetBox before issuing addresses."
+        )
+
+    return serving[0]
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +152,8 @@ class NewIPAddress(Script):
         model=Role,
         label="Role",
         description=(
-            "Prefix role describing what the endpoint is, e.g. Clients or "
-            "Printers. Each site has one prefix per role."
+            "Prefix role describing what the endpoint is, e.g. CTS. Each site "
+            "has one prefix per role."
         ),
     )
     macAddress = StringVar(
@@ -171,19 +183,32 @@ class NewIPAddress(Script):
 
         macAddress = normalizeMacAddress(data['macAddress'])
         prefix = self.resolvePrefix(data['site'], data['role'])
-        supernetNetwork, gateway = resolveSupernet(prefix)
+
+        gatewayAddress = resolveGateway(prefix)
+        gatewayNetwork = netaddr.IPNetwork(str(gatewayAddress.address))
+        gateway = gatewayNetwork.ip
+        endpointNetwork = gatewayNetwork.cidr
 
         self.log_info(
-            f"Allocating from {prefix.prefix}, recording the address as "
-            f"/{supernetNetwork.prefixlen} on supernet {supernetNetwork}.",
-            obj=prefix,
+            f"Gateway {gatewayAddress.address} serves {prefix.prefix}, so the "
+            f"endpoint belongs to {endpointNetwork} and is recorded as "
+            f"/{endpointNetwork.prefixlen}.",
+            obj=gatewayAddress,
         )
+
+        if endpointNetwork == netaddr.IPNetwork(str(prefix.prefix)):
+            self.log_warning(
+                f"The gateway's network is the site prefix itself, so the mask "
+                f"was not widened. Check that {gatewayAddress.address} carries "
+                f"the mask its endpoints are configured with.",
+                obj=gatewayAddress,
+            )
 
         if WARN_ON_DUPLICATE_MAC:
             self.warnOnDuplicateMac(macAddress)
 
         ipAddress = self.allocateAddress(
-            prefix, supernetNetwork, gateway, macAddress, data
+            prefix, endpointNetwork, gateway, macAddress, data
         )
 
         if not commit:
@@ -195,7 +220,7 @@ class NewIPAddress(Script):
         return (
             f"**{ipAddress.address}** issued to `{macAddress}`\n\n"
             f"- Gateway: {gateway}\n"
-            f"- Subnet mask: {supernetNetwork.netmask}\n"
+            f"- Subnet mask: {endpointNetwork.netmask}\n"
             f"- Drawn from: {prefix.prefix} at {data['site']}"
         )
 
@@ -221,6 +246,8 @@ class NewIPAddress(Script):
 
         `_site` is the cached scope field behind NetBox's own `?site_id=` prefix
         filter, so this also matches prefixes scoped to a location in the site.
+        A supernet scoped to a region populates `_region` and leaves `_site`
+        null, so it is never picked up here even when it shares the role.
         """
         prefixes = list(
             Prefix.objects
@@ -259,7 +286,7 @@ class NewIPAddress(Script):
                 obj=duplicate,
             )
 
-    def allocateAddress(self, prefix, supernetNetwork, gateway, macAddress, data):
+    def allocateAddress(self, prefix, endpointNetwork, gateway, macAddress, data):
         with transaction.atomic():
             # Lock the prefix row so two people running this at the same moment
             # cannot be handed the same address.
@@ -274,7 +301,7 @@ class NewIPAddress(Script):
             # get_first_available_ip() returns the host carrying the *prefix's*
             # mask; rewrite it to the mask the endpoint is configured with.
             host = netaddr.IPNetwork(firstAvailable).ip
-            address = f'{host}/{supernetNetwork.prefixlen}'
+            address = f'{host}/{endpointNetwork.prefixlen}'
 
             ipAddress = IPAddress(
                 address=address,
@@ -286,7 +313,7 @@ class NewIPAddress(Script):
             ipAddress.custom_field_data.update({
                 CF_MAC_ADDRESS: macAddress,
                 CF_GATEWAY: str(gateway),
-                CF_SUBNET_MASK: str(supernetNetwork.netmask),
+                CF_SUBNET_MASK: str(endpointNetwork.netmask),
             })
 
             try:
