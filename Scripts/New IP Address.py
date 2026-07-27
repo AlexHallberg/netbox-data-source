@@ -122,8 +122,11 @@ class NewIPAddress(Script):
         description = (
             "Issue the next free IP address at a site to a network endpoint."
         )
+        # NB: no variable below may be called 'description', 'name', 'module',
+        # 'class_name', 'full_name' or 'filename' -- those are classproperties on
+        # BaseScript, and shadowing one breaks the whole script list page.
         field_order = (
-            'site', 'role', 'macAddress', 'dnsName', 'description', 'status',
+            'site', 'role', 'macAddress', 'dnsName', 'ipDescription', 'status',
         )
         commit_default = True
         scheduling_enabled = False
@@ -153,7 +156,7 @@ class NewIPAddress(Script):
         description="Hostname for the endpoint. Leave blank if unknown.",
         required=False,
     )
-    description = StringVar(
+    ipDescription = StringVar(
         label="Description",
         description="Who or what this address was issued to, and why.",
     )
@@ -278,7 +281,7 @@ class NewIPAddress(Script):
                 status=data['status'],
                 vrf=lockedPrefix.vrf,
                 dns_name=data['dnsName'] or '',
-                description=data['description'],
+                description=data['ipDescription'],
             )
             ipAddress.custom_field_data.update({
                 CF_MAC_ADDRESS: macAddress,
